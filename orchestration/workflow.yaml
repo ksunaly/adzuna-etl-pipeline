@@ -1,0 +1,12 @@
+main:
+  steps:
+    - extract_jobs:
+        call: http.post
+        args:
+          url: https://adzuna-extractor-1068906544488.us-central1.run.app/extract
+          auth:
+            type: OIDC
+        result: extract_result
+
+    - return_result:
+        return: ${extract_result.body}
