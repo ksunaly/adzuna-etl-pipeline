@@ -1,5 +1,11 @@
 main:
   steps:
+    # Create unique Spark batch ID
+    - init:
+        assign:
+          - batch_id: ${"adzuna-" + sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+
+    # 1. Extract jobs from Adzuna
     - extract_jobs:
         call: http.post
         args:
@@ -8,5 +14,105 @@ main:
             type: OIDC
         result: extract_result
 
+    # 2. Start Spark transformation
+    - start_spark_batch:
+        call: http.post
+        args:
+          url: https://dataproc.googleapis.com/v1/projects/adzuna-etl-pipeline/locations/us-central1/batches
+          auth:
+            type: OAuth2
+          query:
+            batchId: ${batch_id}
+          body:
+            pysparkBatch:
+              mainPythonFileUri: gs://adzuna-etl-pipeline-1068906544488/scripts/transform_jobs.py
+            runtimeConfig:
+              version: "3.0"
+            environmentConfig:
+              executionConfig:
+                serviceAccount: adzuna-pipeline-sa@adzuna-etl-pipeline.iam.gserviceaccount.com
+                subnetworkUri: projects/adzuna-etl-pipeline/regions/us-central1/subnetworks/adzuna-subnet
+                authenticationConfig:
+                  userWorkloadAuthenticationType: SERVICE_ACCOUNT
+        result: spark_operation
+
+    # 3. Wait before checking Spark
+    - wait_before_check:
+        call: sys.sleep
+        args:
+          seconds: 15
+
+    # 4. Check Spark status
+    - check_spark:
+        call: http.get
+        args:
+          url: ${"https://dataproc.googleapis.com/v1/" + spark_operation.body.name}
+          auth:
+            type: OAuth2
+        result: spark_status
+
+    # 5. Keep waiting until Spark finishes
+    - spark_finished:
+        switch:
+          - condition: ${map.get(spark_status.body, "done") == true}
+            next: check_spark_result
+        next: wait_before_check
+
+    # 6. Stop if Spark failed
+    - check_spark_result:
+        switch:
+          - condition: ${map.get(spark_status.body, "error") != null}
+            raise: ${spark_status.body.error}
+        next: load_bigquery
+
+    # 7. Load Parquet into BigQuery
+    - load_bigquery:
+        call: googleapis.bigquery.v2.jobs.insert
+        args:
+          projectId: adzuna-etl-pipeline
+          body:
+            jobReference:
+              location: us-central1
+            configuration:
+              load:
+                sourceUris:
+                  - gs://adzuna-etl-pipeline-1068906544488/transformed/jobs/*.parquet
+                sourceFormat: PARQUET
+                destinationTable:
+                  projectId: adzuna-etl-pipeline
+                  datasetId: adzuna_jobs
+                  tableId: jobs
+                createDisposition: CREATE_IF_NEEDED
+                writeDisposition: WRITE_TRUNCATE
+        result: bigquery_result
+
+    # 8. Enrich next batch of jobs with Gemini
+    - enrich_jobs:
+        call: http.post
+        args:
+          url: https://adzuna-ai-enricher-1068906544488.us-central1.run.app/enrich
+          auth:
+            type: OIDC
+        result: enrich_result
+
+    # 9. Check whether more jobs remain
+    - check_enrichment:
+        switch:
+          - condition: ${enrich_result.body.jobs_enriched > 0}
+            next: wait_before_enrichment
+        next: return_result
+
+    # 10. Wait briefly before next Gemini batch
+    - wait_before_enrichment:
+        call: sys.sleep
+        args:
+          seconds: 2
+        next: enrich_jobs
+
+    # 11. Finish workflow
     - return_result:
-        return: ${extract_result.body}
+        return:
+          extraction: ${extract_result.body}
+          spark: ${spark_status.body}
+          bigquery: ${bigquery_result}
+          enrichment: ${enrich_result.body}
